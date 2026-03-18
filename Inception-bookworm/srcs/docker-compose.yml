@@ -1,0 +1,196 @@
+# C’est la version du format Compose.
+# Ça influence les features YAML acceptées.
+# Rien de “runtime” ici, c’est juste le format
+# version: "3.9"
+
+
+# Ça déclare les containers que Compose va gérer.
+# On en as 3 : mariadb, wordpress, nginx.
+# Chaque service = un container (un processus isolé + FS + réseau).
+services:
+  mariadb:
+    # Le container s’appellera exactement mariadb.
+    # Sans ça, Compose ferait un nom du style inception-mariadb-1.
+    container_name: mariadb
+
+    image: mariadb:local
+
+    # Compose va faire un docker build dans ce dossier.
+    # Il cherche un fichier Dockerfile dans srcs/requirements/mariadb/Dockerfile.
+    # Résultat : il crée une image locale (sans DockerHub), puis lance le container à partir de cette image.
+    build: ./requirements/mariadb
+
+    # Compose lit srcs/.env et injecte ces variables dans le container.
+    # Ça veut dire : dans le container, printenv verra DB_NAME, DB_USER, etc.
+    # Attention : pas de passwords ici (on les gardes en secrets fichiers).
+    env_file:
+      - .env
+
+    # /var/lib/mysql = endroit où MariaDB stocke les données (tables, logs internes, etc.)
+    # mariadb_data = volume Docker (nommé) qui va persister même si on recré le container.
+    # Dans ce compose, mariadb_data est configuré plus bas pour pointer vers :
+    # /home/mwallis/data/mariadb
+    # Du coup :
+    # MariaDB écrit dans /var/lib/mysql (dans le container)
+    # mais c’est stocké physiquement dans /home/mwallis/data/mariadb (sur la VM)
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ../secrets:/run/secrets:ro
+
+
+    # MariaDB est connecté au réseau Docker inception.
+    # Donc WordPress pourra joindre la DB via le hostname mariadb
+    networks:
+      - inception
+
+    # Si le process MariaDB crash → Docker redémarre le container automatiquement.
+    # Sauf si on l’arrête explicitement.
+    restart: unless-stopped
+
+  wordpress:
+    container_name: wordpress
+    image: wordpress:local
+    build: ./requirements/wordpress
+    env_file:
+      - .env
+
+    # Compose démarre mariadb avant wordpress.
+    # Important : ça ne garantit pas que la DB est prête, juste qu’elle a été lancée.
+    # (wait DB ready” est gere dans le script WordPress par la suite.)
+    depends_on:
+      - mariadb
+      - redis
+
+    # WordPress (fichiers du site) est dans /var/www/html.
+    # Ça sera stocké physiquement dans /home/mwallis/data/wordpress.
+    volumes:
+      - wordpress_data:/var/www/html
+      - ../secrets:/run/secrets:ro
+
+    # WordPress peut contacter MariaDB via mariadb.
+    networks:
+      - inception
+    restart: unless-stopped
+
+  nginx:
+    container_name: nginx
+    image: nginx:local
+    build: ./requirements/nginx
+    env_file:
+      - .env
+
+    # nginx est démarré après WordPress (pareil : “started”, pas “ready”).
+    depends_on:
+      - wordpress
+
+    # C’est la seule “porte” vers l’extérieur.
+    # Concrètement : le navigateur parle à la VM:443 -> qui redirige vers container nginx:443.
+    ports:
+      - "443:443"
+
+    # nginx a besoin de lire certains fichiers WP (assets, etc.)
+    # :ro = read-only : nginx ne peut pas écrire dedans.
+    # C’est une bonne pratique (et plus safe).
+    volumes:
+      - wordpress_data:/var/www/html:ro
+    networks:
+      - inception
+    restart: unless-stopped
+
+
+
+
+  adminer:
+    container_name: adminer
+    image: adminer:local
+    build: ./requirements/bonus/adminer
+
+    env_file:
+      - .env
+    depends_on:
+      - mariadb
+    ports:
+      - "8080:8080"
+    networks:
+      - inception
+    restart: unless-stopped
+
+
+
+  static_website:
+    container_name: static_website
+    image: static_website:local
+    build: ./requirements/bonus/static_website
+    ports:
+      - "8081:80"
+    networks:
+      - inception
+    restart: unless-stopped
+
+
+
+  ftp:
+    container_name: ftp
+    image: ftp:local
+    build: ./requirements/bonus/ftp
+    env_file:
+      - .env
+    ports:
+      - "21:21"
+      - "21000-21010:21000-21010"
+    volumes:
+      - wordpress_data:/var/www/html
+      - ../secrets:/run/secrets:ro
+    networks:
+      - inception
+    restart: unless-stopped
+
+
+
+  redis:
+    container_name: redis
+    image: redis:local
+    build: ./requirements/bonus/redis
+    networks:
+      - inception
+    restart: unless-stopped
+
+
+  netdata:
+    container_name: netdata
+    image: netdata:local
+    build: ./requirements/bonus/netdata
+    ports:
+      - "19999:19999"
+    restart: always
+    networks:
+      - inception
+    
+
+# Docker crée un réseau “bridge” isolé (virtuel) pour les 3 services.
+# Ils ont DNS interne + IPs internes.
+# Aucun accès depuis l’extérieur tant qu'on n’expose pas un port.
+networks:
+  inception:
+    driver: bridge
+
+
+# Pourquoi pas juste un volume normal ?
+# Le sujet impose que les données soient dans :
+# /home/mwallis/data/mariadb
+# /home/mwallis/data/wordpress
+# Donc on utilise un volume Docker qui est en réalité un bind vers un dossier précis.
+volumes:
+  mariadb_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/mwallis/data/mariadb
+
+  wordpress_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/mwallis/data/wordpress
